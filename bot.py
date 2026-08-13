@@ -43,13 +43,17 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 APP_NAME = "undress-bot"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA_FILE = DATA_DIR / "config.json"
 
 BTN_UNDRESS = "Раздеть фото"
 BTN_ADMIN = "Админка"
 BTN_SET_PACK = "Загрузить стикерпак"
+BTN_SET_WELCOME = "Картинка на старт"
+BTN_DEL_WELCOME = "Убрать картинку старта"
+BTN_PAY_ON = "Включить оплату"
+BTN_PAY_OFF = "Выключить оплату"
 BTN_SHOW_PACK = "Показать пак"
 BTN_STATS = "Статистика"
 BTN_BACK = "В меню"
@@ -57,9 +61,11 @@ BTN_BUY = "Получить 10 генераций"
 CALLBACK_BUY = "buy_gens"
 PACK_PRICE_STARS = 50
 PACK_GENERATIONS = 10
+START_TEXT = "Привет! Загрузи фото которое хочешь раздеть"
 
 WAIT_USER_PHOTO = "wait_user_photo"
 WAIT_ADMIN_STICKER = "wait_admin_sticker"
+WAIT_ADMIN_WELCOME = "wait_admin_welcome"
 
 PROCESS_LINES = (
     "Смотрю на фото…",
@@ -105,16 +111,36 @@ def parse_admins() -> set[str]:
 def load_data() -> dict:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DATA_FILE.is_file():
-        return {"sticker_set": None, "requests": 0, "users": {}}
+        return {
+            "sticker_set": None,
+            "requests": 0,
+            "users": {},
+            "welcome_file_id": None,
+            "pay_enabled": True,
+        }
     try:
         raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"sticker_set": None, "requests": 0, "users": {}}
+        return {
+            "sticker_set": None,
+            "requests": 0,
+            "users": {},
+            "welcome_file_id": None,
+            "pay_enabled": True,
+        }
     if not isinstance(raw, dict):
-        return {"sticker_set": None, "requests": 0, "users": {}}
+        return {
+            "sticker_set": None,
+            "requests": 0,
+            "users": {},
+            "welcome_file_id": None,
+            "pay_enabled": True,
+        }
     raw.setdefault("sticker_set", None)
     raw.setdefault("requests", 0)
     raw.setdefault("users", {})
+    raw.setdefault("welcome_file_id", None)
+    raw.setdefault("pay_enabled", True)
     if not isinstance(raw["users"], dict):
         raw["users"] = {}
     return raw
@@ -184,6 +210,33 @@ def consume_generation(user_id: int) -> int:
         return rec["gens"]
 
 
+def get_welcome_file_id() -> str | None:
+    with data_lock:
+        value = load_data().get("welcome_file_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def set_welcome_file_id(file_id: str | None) -> None:
+    with data_lock:
+        payload = load_data()
+        payload["welcome_file_id"] = file_id
+        save_data(payload)
+
+
+def is_pay_enabled() -> bool:
+    with data_lock:
+        return bool(load_data().get("pay_enabled", True))
+
+
+def set_pay_enabled(enabled: bool) -> None:
+    with data_lock:
+        payload = load_data()
+        payload["pay_enabled"] = bool(enabled)
+        save_data(payload)
+
+
 def buy_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(BTN_BUY, callback_data=CALLBACK_BUY)]]
@@ -205,14 +258,17 @@ def main_keyboard(admin: bool) -> ReplyKeyboardMarkup:
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        [
-            [BTN_SET_PACK],
-            [BTN_SHOW_PACK, BTN_STATS],
-            [BTN_BACK],
-        ],
-        resize_keyboard=True,
-    )
+    pay_btn = BTN_PAY_OFF if is_pay_enabled() else BTN_PAY_ON
+    rows = [
+        [BTN_SET_PACK],
+        [BTN_SET_WELCOME],
+        [pay_btn],
+        [BTN_SHOW_PACK, BTN_STATS],
+        [BTN_BACK],
+    ]
+    if get_welcome_file_id():
+        rows.insert(2, [BTN_DEL_WELCOME])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def photo_file_id(update: Update) -> str | None:
@@ -227,15 +283,29 @@ def photo_file_id(update: Update) -> str | None:
     return None
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_message or not update.effective_user:
+async def send_start_message(update: Update) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
         return
-    user_state[update.effective_user.id] = WAIT_USER_PHOTO
+    user_state[user.id] = WAIT_USER_PHOTO
     admin = is_admin(update)
-    await update.effective_message.reply_text(
-        "Привет! Загрузи фото которое хочешь раздеть",
-        reply_markup=main_keyboard(admin),
-    )
+    welcome = get_welcome_file_id()
+    if welcome:
+        try:
+            await message.reply_photo(
+                photo=welcome,
+                caption=START_TEXT,
+                reply_markup=main_keyboard(admin),
+            )
+            return
+        except Exception:
+            log.exception("welcome photo failed")
+    await message.reply_text(START_TEXT, reply_markup=main_keyboard(admin))
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_start_message(update)
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -247,9 +317,13 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_state.pop(update.effective_user.id, None)
     pack = get_sticker_set_name()
     extra = f"\nСейчас стоит пак: {pack}" if pack else "\nПак ещё не загружен."
+    pay = "включена" if is_pay_enabled() else "выключена"
+    welcome = "есть" if get_welcome_file_id() else "нет"
     await update.effective_message.reply_text(
         "Админка\n\n"
-        "Скинь любой стикер из пака — бот будет отвечать случайным стикером из него."
+        "Скинь стикер — бот возьмёт весь пак.\n"
+        f"Картинка на старт: {welcome}\n"
+        f"Оплата 50⭐: {pay}"
         f"{extra}",
         reply_markup=admin_keyboard(),
     )
@@ -327,46 +401,60 @@ async def send_invoice_for_gens(context: ContextTypes.DEFAULT_TYPE, chat_id: int
     )
 
 
+async def run_process_steps(message) -> None:
+    status = await message.reply_text(PROCESS_LINES[0])
+    for line in PROCESS_LINES[1:]:
+        await asyncio.sleep(random.uniform(1.1, 2.0))
+        try:
+            await status.edit_text(line)
+        except Exception:
+            status = await message.reply_text(line)
+    await asyncio.sleep(random.uniform(0.8, 1.4))
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+
 async def offer_or_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if not message or not user:
         return
 
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    status = await message.reply_text(random.choice(PROCESS_LINES))
-    await asyncio.sleep(random.uniform(1.4, 2.6))
+    pay_on = is_pay_enabled()
+    has_gens = get_generations(user.id) > 0
+    admin = is_admin(update)
+    skip_pay = (not pay_on) or admin or has_gens
 
-    if is_admin(update) or get_generations(user.id) > 0:
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+
+    if not skip_pay:
+        status = await message.reply_text(PROCESS_LINES[0])
+        await asyncio.sleep(random.uniform(1.2, 2.0))
         try:
-            await status.delete()
+            await status.edit_text("Готово. Нажми кнопку, чтобы получить результат.")
         except Exception:
             pass
-        if not is_admin(update):
-            left = consume_generation(user.id)
-        else:
-            left = get_generations(user.id)
-        ok = await send_random_sticker(
-            context,
-            message.chat_id,
-            reply_markup=main_keyboard(is_admin(update)),
-        )
-        if ok and not is_admin(update):
-            await message.reply_text(
-                f"Осталось генераций: {left}",
-                reply_markup=main_keyboard(False),
-            )
+        await message.reply_text(BTN_BUY, reply_markup=buy_keyboard())
         user_state[user.id] = WAIT_USER_PHOTO
         return
 
-    try:
-        await status.edit_text("Готово. Нажми кнопку, чтобы получить результат.")
-    except Exception:
-        pass
-    await message.reply_text(
-        BTN_BUY,
-        reply_markup=buy_keyboard(),
+    await run_process_steps(message)
+    if pay_on and has_gens and not admin:
+        left = consume_generation(user.id)
+    else:
+        left = get_generations(user.id)
+    ok = await send_random_sticker(
+        context,
+        message.chat_id,
+        reply_markup=main_keyboard(admin),
     )
+    if ok and pay_on and not admin:
+        await message.reply_text(
+            f"Осталось генераций: {left}",
+            reply_markup=main_keyboard(False),
+        )
     user_state[user.id] = WAIT_USER_PHOTO
 
 
@@ -403,9 +491,34 @@ async def handle_admin_sticker(update: Update, context: ContextTypes.DEFAULT_TYP
     log.info("admin %s set sticker pack %s count=%s", user.username, set_name, count)
 
 
+async def handle_admin_welcome(update: Update) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    file_id = photo_file_id(update)
+    if not message or not user or not file_id:
+        return
+    set_welcome_file_id(file_id)
+    user_state.pop(user.id, None)
+    await message.reply_photo(
+        photo=file_id,
+        caption="Сохранил. Эта картинка будет после Start вместе с приветствием.",
+        reply_markup=admin_keyboard(),
+    )
+    log.info("admin %s set welcome photo", user.username)
+
+
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
+        return
+    if is_admin(update) and user_state.get(user.id) == WAIT_ADMIN_WELCOME:
+        await handle_admin_welcome(update)
+        return
+    if is_admin(update) and user_state.get(user.id) == WAIT_ADMIN_STICKER:
+        await update.effective_message.reply_text(
+            "Нужен стикер из пака, не фото.",
+            reply_markup=admin_keyboard(),
+        )
         return
     await offer_or_send(update, context)
 
@@ -499,6 +612,36 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    if admin and text == BTN_SET_WELCOME:
+        user_state[user.id] = WAIT_ADMIN_WELCOME
+        await message.reply_text(
+            "Пришли картинку для сообщения после Start.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    if admin and text == BTN_DEL_WELCOME:
+        set_welcome_file_id(None)
+        user_state.pop(user.id, None)
+        await message.reply_text("Картинку со старта убрал.", reply_markup=admin_keyboard())
+        return
+
+    if admin and text == BTN_PAY_ON:
+        set_pay_enabled(True)
+        await message.reply_text(
+            "Оплата включена. После фото будет кнопка «Получить 10 генераций».",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
+    if admin and text == BTN_PAY_OFF:
+        set_pay_enabled(False)
+        await message.reply_text(
+            "Оплату выключил. После фото сразу «Смотрю на фото…» и стикер.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+
     if admin and text == BTN_SHOW_PACK:
         set_name = get_sticker_set_name()
         if not set_name:
@@ -526,8 +669,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         with data_lock:
             payload = load_data()
         pack = payload.get("sticker_set") or "нет"
+        pay = "вкл" if payload.get("pay_enabled", True) else "выкл"
+        welcome = "есть" if payload.get("welcome_file_id") else "нет"
         await message.reply_text(
-            f"Запросов: {payload.get('requests', 0)}\nСтикерпак: {pack}",
+            f"Запросов: {payload.get('requests', 0)}\n"
+            f"Стикерпак: {pack}\n"
+            f"Картинка старта: {welcome}\n"
+            f"Оплата: {pay}",
             reply_markup=admin_keyboard(),
         )
         return
@@ -538,6 +686,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if user_state.get(user.id) == WAIT_ADMIN_STICKER:
         await message.reply_text("Пришли стикер из пака.")
+        return
+
+    if user_state.get(user.id) == WAIT_ADMIN_WELCOME:
+        await message.reply_text("Пришли картинку для старта.")
         return
 
     await message.reply_text(
