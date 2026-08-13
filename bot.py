@@ -22,15 +22,20 @@ from pathlib import Path
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
     ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -38,7 +43,7 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 APP_NAME = "undress-bot"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA_FILE = DATA_DIR / "config.json"
 
@@ -48,6 +53,10 @@ BTN_SET_PACK = "Загрузить стикерпак"
 BTN_SHOW_PACK = "Показать пак"
 BTN_STATS = "Статистика"
 BTN_BACK = "В меню"
+BTN_BUY = "Получить 10 генераций"
+CALLBACK_BUY = "buy_gens"
+PACK_PRICE_STARS = 50
+PACK_GENERATIONS = 10
 
 WAIT_USER_PHOTO = "wait_user_photo"
 WAIT_ADMIN_STICKER = "wait_admin_sticker"
@@ -96,15 +105,18 @@ def parse_admins() -> set[str]:
 def load_data() -> dict:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DATA_FILE.is_file():
-        return {"sticker_set": None, "requests": 0}
+        return {"sticker_set": None, "requests": 0, "users": {}}
     try:
         raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"sticker_set": None, "requests": 0}
+        return {"sticker_set": None, "requests": 0, "users": {}}
     if not isinstance(raw, dict):
-        return {"sticker_set": None, "requests": 0}
-    raw.setdefault("sticker_set", raw.get("reply_file_id") and None)
+        return {"sticker_set": None, "requests": 0, "users": {}}
+    raw.setdefault("sticker_set", None)
     raw.setdefault("requests", 0)
+    raw.setdefault("users", {})
+    if not isinstance(raw["users"], dict):
+        raw["users"] = {}
     return raw
 
 
@@ -137,6 +149,45 @@ def bump_requests() -> int:
         payload["requests"] = int(payload.get("requests") or 0) + 1
         save_data(payload)
         return int(payload["requests"])
+
+
+def get_generations(user_id: int) -> int:
+    with data_lock:
+        users = load_data().get("users") or {}
+        rec = users.get(str(user_id)) or {}
+    try:
+        return max(0, int(rec.get("gens") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def add_generations(user_id: int, amount: int) -> int:
+    with data_lock:
+        payload = load_data()
+        users = payload.setdefault("users", {})
+        rec = users.setdefault(str(user_id), {"gens": 0})
+        rec["gens"] = max(0, int(rec.get("gens") or 0) + int(amount))
+        save_data(payload)
+        return int(rec["gens"])
+
+
+def consume_generation(user_id: int) -> int:
+    with data_lock:
+        payload = load_data()
+        users = payload.setdefault("users", {})
+        rec = users.setdefault(str(user_id), {"gens": 0})
+        current = max(0, int(rec.get("gens") or 0))
+        if current <= 0:
+            return 0
+        rec["gens"] = current - 1
+        save_data(payload)
+        return rec["gens"]
+
+
+def buy_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(BTN_BUY, callback_data=CALLBACK_BUY)]]
+    )
 
 
 def is_admin(update: Update) -> bool:
@@ -224,52 +275,98 @@ async def pick_random_sticker(context: ContextTypes.DEFAULT_TYPE, set_name: str)
     return random.choice(stickers), sticker_set
 
 
-async def send_reply_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_random_sticker(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    reply_markup=None,
+) -> bool:
+    set_name = get_sticker_set_name()
+    if not set_name:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Пока нет стикерпака. Админ ещё не скинул стикер в бота.",
+            reply_markup=reply_markup,
+        )
+        return False
+    try:
+        sticker, _pack = await pick_random_sticker(context, set_name)
+    except Exception:
+        log.exception("get_sticker_set failed name=%s", set_name)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Не получилось взять стикерпак. Админ, скинь стикер ещё раз.",
+            reply_markup=reply_markup,
+        )
+        return False
+    if not sticker:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="В паке нет стикеров.",
+            reply_markup=reply_markup,
+        )
+        return False
+    await context.bot.send_sticker(
+        chat_id=chat_id,
+        sticker=sticker.file_id,
+        reply_markup=reply_markup,
+    )
+    bump_requests()
+    return True
+
+
+async def send_invoice_for_gens(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> None:
+    payload = f"gens_{user_id}_{int(time.time())}"
+    await context.bot.send_invoice(
+        chat_id=chat_id,
+        title="10 генераций",
+        description="10 генераций раздевания фото",
+        payload=payload,
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="10 генераций", amount=PACK_PRICE_STARS)],
+    )
+
+
+async def offer_or_send(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if not message or not user:
         return
 
-    set_name = get_sticker_set_name()
-    if not set_name:
-        await message.reply_text(
-            "Пока нет стикерпака. Админ ещё не скинул пак в админке.",
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    status = await message.reply_text(random.choice(PROCESS_LINES))
+    await asyncio.sleep(random.uniform(1.4, 2.6))
+
+    if is_admin(update) or get_generations(user.id) > 0:
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        if not is_admin(update):
+            left = consume_generation(user.id)
+        else:
+            left = get_generations(user.id)
+        ok = await send_random_sticker(
+            context,
+            message.chat_id,
             reply_markup=main_keyboard(is_admin(update)),
         )
-        return
-
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.CHOOSE_STICKER)
-    status = await message.reply_text(random.choice(PROCESS_LINES))
-    await asyncio.sleep(random.uniform(1.6, 3.2))
-
-    try:
-        sticker, _pack = await pick_random_sticker(context, set_name)
-    except Exception:
-        log.exception("get_sticker_set failed name=%s", set_name)
-        try:
-            await status.edit_text("Не получилось взять стикерпак. Админ, скинь пак ещё раз.")
-        except Exception:
-            pass
-        return
-
-    if not sticker:
-        try:
-            await status.edit_text("В паке нет стикеров.")
-        except Exception:
-            pass
+        if ok and not is_admin(update):
+            await message.reply_text(
+                f"Осталось генераций: {left}",
+                reply_markup=main_keyboard(False),
+            )
+        user_state[user.id] = WAIT_USER_PHOTO
         return
 
     try:
-        await status.delete()
+        await status.edit_text("Готово. Нажми кнопку, чтобы получить результат.")
     except Exception:
         pass
-
-    await message.reply_sticker(
-        sticker=sticker.file_id,
-        reply_markup=main_keyboard(is_admin(update)),
+    await message.reply_text(
+        BTN_BUY,
+        reply_markup=buy_keyboard(),
     )
-    total = bump_requests()
-    log.info("sticker sent to %s pack=%s total=%s", user.id, set_name, total)
     user_state[user.id] = WAIT_USER_PHOTO
 
 
@@ -310,26 +407,66 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
-    if user_state.get(user.id) == WAIT_ADMIN_STICKER and is_admin(update):
-        await update.effective_message.reply_text(
-            "Нужен стикер из пака, не фото.",
-            reply_markup=admin_keyboard(),
-        )
-        return
-    await send_reply_sticker(update, context)
+    await offer_or_send(update, context)
 
 
 async def on_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
-    if is_admin(update) and user_state.get(user.id) == WAIT_ADMIN_STICKER:
+    if is_admin(update):
         await handle_admin_sticker(update, context)
         return
     await update.effective_message.reply_text(
         "Пришли фото, не стикер.",
+        reply_markup=main_keyboard(False),
+    )
+
+
+async def on_buy_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message or not update.effective_user:
+        return
+    await query.answer()
+    await send_invoice_for_gens(context, query.message.chat_id, update.effective_user.id)
+
+
+async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    if not query:
+        return
+    payload = query.invoice_payload or ""
+    if payload.startswith("gens_"):
+        await query.answer(ok=True)
+        return
+    await query.answer(ok=False, error_message="Неизвестный платёж")
+
+
+async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not message.successful_payment:
+        return
+    payload = message.successful_payment.invoice_payload or ""
+    if not payload.startswith("gens_"):
+        return
+    left = add_generations(user.id, PACK_GENERATIONS)
+    log.info("stars paid user=%s gens=%s payload=%s", user.id, left, payload)
+    await message.reply_text(
+        f"Оплата прошла. Начислено {PACK_GENERATIONS} генераций.",
         reply_markup=main_keyboard(is_admin(update)),
     )
+    left = consume_generation(user.id)
+    ok = await send_random_sticker(
+        context,
+        message.chat_id,
+        reply_markup=main_keyboard(is_admin(update)),
+    )
+    if ok:
+        await message.reply_text(
+            f"Осталось генераций: {left}",
+            reply_markup=main_keyboard(is_admin(update)),
+        )
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -492,6 +629,9 @@ def main() -> None:
             )
             app.add_handler(CommandHandler("start", cmd_start))
             app.add_handler(CommandHandler("admin", cmd_admin))
+            app.add_handler(CallbackQueryHandler(on_buy_click, pattern=f"^{CALLBACK_BUY}$"))
+            app.add_handler(PreCheckoutQueryHandler(pre_checkout))
+            app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
             app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
             app.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
