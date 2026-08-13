@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import random
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -388,6 +389,12 @@ def main() -> None:
         port = int(os.getenv("PORT", "3000"))
     except ValueError:
         port = 3000
+
+    if sys.version_info >= (3, 10):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
 
     threading.Thread(target=start_http, args=(port,), daemon=True).start()
     log.info(
