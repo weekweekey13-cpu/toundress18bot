@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: toundress18bot
+    runtime: python
+    plan: free
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u bot.py
+    healthCheckPath: /api/ping
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_USERNAMES
+        value: bonamartin69
