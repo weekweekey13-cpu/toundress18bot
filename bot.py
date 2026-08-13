@@ -1,8 +1,8 @@
 """
 Шуточный Telegram-бот «Раздеть фото».
 
-Человек жмёт кнопку, присылает фото — бот отвечает картинкой,
-которую админ заранее загрузил в админке.
+Человек присылает фото — бот отвечает случайным стикером
+из пака, который админ заранее скинул в админке.
 Никакой обработки чужого фото нет: это розыгрыш.
 """
 
@@ -38,19 +38,19 @@ ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
 APP_NAME = "undress-bot"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA_FILE = DATA_DIR / "config.json"
 
 BTN_UNDRESS = "Раздеть фото"
 BTN_ADMIN = "Админка"
-BTN_SET_PHOTO = "Загрузить фото ответа"
-BTN_SHOW_PHOTO = "Показать текущее фото"
+BTN_SET_PACK = "Загрузить стикерпак"
+BTN_SHOW_PACK = "Показать пак"
 BTN_STATS = "Статистика"
 BTN_BACK = "В меню"
 
 WAIT_USER_PHOTO = "wait_user_photo"
-WAIT_ADMIN_PHOTO = "wait_admin_photo"
+WAIT_ADMIN_STICKER = "wait_admin_sticker"
 
 PROCESS_LINES = (
     "Смотрю на фото…",
@@ -96,14 +96,14 @@ def parse_admins() -> set[str]:
 def load_data() -> dict:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DATA_FILE.is_file():
-        return {"reply_file_id": None, "requests": 0}
+        return {"sticker_set": None, "requests": 0}
     try:
         raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"reply_file_id": None, "requests": 0}
+        return {"sticker_set": None, "requests": 0}
     if not isinstance(raw, dict):
-        return {"reply_file_id": None, "requests": 0}
-    raw.setdefault("reply_file_id", None)
+        return {"sticker_set": None, "requests": 0}
+    raw.setdefault("sticker_set", raw.get("reply_file_id") and None)
     raw.setdefault("requests", 0)
     return raw
 
@@ -115,19 +115,19 @@ def save_data(payload: dict) -> None:
     tmp.replace(DATA_FILE)
 
 
-def get_reply_file_id() -> str | None:
+def get_sticker_set_name() -> str | None:
     with data_lock:
-        value = load_data().get("reply_file_id")
+        value = load_data().get("sticker_set")
     if isinstance(value, str) and value.strip():
         return value.strip()
-    env_id = os.getenv("REPLY_FILE_ID", "").strip()
-    return env_id or None
+    env_name = os.getenv("STICKER_SET", "").strip()
+    return env_name or None
 
 
-def set_reply_file_id(file_id: str) -> None:
+def set_sticker_set_name(name: str) -> None:
     with data_lock:
         payload = load_data()
-        payload["reply_file_id"] = file_id
+        payload["sticker_set"] = name
         save_data(payload)
 
 
@@ -156,8 +156,8 @@ def main_keyboard(admin: bool) -> ReplyKeyboardMarkup:
 def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [BTN_SET_PHOTO],
-            [BTN_SHOW_PHOTO, BTN_STATS],
+            [BTN_SET_PACK],
+            [BTN_SHOW_PACK, BTN_STATS],
             [BTN_BACK],
         ],
         resize_keyboard=True,
@@ -179,16 +179,12 @@ def photo_file_id(update: Update) -> str | None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_message or not update.effective_user:
         return
-    user_state.pop(update.effective_user.id, None)
+    user_state[update.effective_user.id] = WAIT_USER_PHOTO
     admin = is_admin(update)
-    text = (
-        "Привет! Это шуточный бот.\n\n"
-        "Нажми «Раздеть фото» и пришли снимок — "
-        "я отвечу заранее подготовленной картинкой."
+    await update.effective_message.reply_text(
+        "Привет! Загрузи фото которое хочешь раздеть",
+        reply_markup=main_keyboard(admin),
     )
-    if admin:
-        text += "\n\nТы админ. Открой «Админка», чтобы загрузить фото ответа."
-    await update.effective_message.reply_text(text, reply_markup=main_keyboard(admin))
 
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,9 +194,12 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text("Админка только для владельца.")
         return
     user_state.pop(update.effective_user.id, None)
+    pack = get_sticker_set_name()
+    extra = f"\nСейчас стоит пак: {pack}" if pack else "\nПак ещё не загружен."
     await update.effective_message.reply_text(
         "Админка\n\n"
-        "Загрузи фото — его будут получать все, кто нажмёт «Раздеть фото».",
+        "Скинь любой стикер из пака — бот будет отвечать случайным стикером из него."
+        f"{extra}",
         reply_markup=admin_keyboard(),
     )
 
@@ -217,64 +216,120 @@ async def ask_user_photo(update: Update) -> None:
     )
 
 
-async def send_reply_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def pick_random_sticker(context: ContextTypes.DEFAULT_TYPE, set_name: str):
+    sticker_set = await context.bot.get_sticker_set(set_name)
+    stickers = list(sticker_set.stickers or [])
+    if not stickers:
+        return None, sticker_set
+    return random.choice(stickers), sticker_set
+
+
+async def send_reply_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if not message or not user:
         return
 
-    file_id = get_reply_file_id()
-    if not file_id:
+    set_name = get_sticker_set_name()
+    if not set_name:
         await message.reply_text(
-            "Пока нет готового ответа. Админ ещё не загрузил фото.",
+            "Пока нет стикерпака. Админ ещё не скинул пак в админке.",
             reply_markup=main_keyboard(is_admin(update)),
         )
         return
 
-    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.UPLOAD_PHOTO)
+    await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.CHOOSE_STICKER)
     status = await message.reply_text(random.choice(PROCESS_LINES))
     await asyncio.sleep(random.uniform(1.6, 3.2))
+
     try:
-        await status.edit_text("Готово.")
+        sticker, _pack = await pick_random_sticker(context, set_name)
+    except Exception:
+        log.exception("get_sticker_set failed name=%s", set_name)
+        try:
+            await status.edit_text("Не получилось взять стикерпак. Админ, скинь пак ещё раз.")
+        except Exception:
+            pass
+        return
+
+    if not sticker:
+        try:
+            await status.edit_text("В паке нет стикеров.")
+        except Exception:
+            pass
+        return
+
+    try:
+        await status.delete()
     except Exception:
         pass
 
-    await message.reply_photo(
-        photo=file_id,
-        caption="Держи 😄",
+    await message.reply_sticker(
+        sticker=sticker.file_id,
         reply_markup=main_keyboard(is_admin(update)),
     )
     total = bump_requests()
-    log.info("reply sent to %s total=%s", user.id, total)
-    user_state.pop(user.id, None)
+    log.info("sticker sent to %s pack=%s total=%s", user.id, set_name, total)
+    user_state[user.id] = WAIT_USER_PHOTO
 
 
-async def handle_admin_upload(update: Update) -> None:
+async def handle_admin_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
-    file_id = photo_file_id(update)
-    if not message or not user or not file_id:
+    if not message or not user or not message.sticker:
         return
-    set_reply_file_id(file_id)
+    set_name = (message.sticker.set_name or "").strip()
+    if not set_name:
+        await message.reply_text(
+            "Этот стикер не из пака. Пришли стикер именно из стикерпака.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+    try:
+        sticker_set = await context.bot.get_sticker_set(set_name)
+    except Exception:
+        log.exception("admin get_sticker_set failed name=%s", set_name)
+        await message.reply_text(
+            "Не смог открыть этот пак. Пришли другой стикер из пака.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+    set_sticker_set_name(set_name)
     user_state.pop(user.id, None)
-    await message.reply_photo(
-        photo=file_id,
-        caption="Сохранил. Теперь это фото будут получать все, кто пришлёт снимок.",
+    count = len(sticker_set.stickers or [])
+    title = sticker_set.title or set_name
+    await message.reply_text(
+        f"Сохранил пак «{title}» ({count} шт.).\n"
+        "Теперь бот будет отвечать случайным стикером из него.",
         reply_markup=admin_keyboard(),
     )
-    log.info("admin %s set reply photo", user.username)
+    log.info("admin %s set sticker pack %s count=%s", user.username, set_name, count)
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not user:
         return
-    state = user_state.get(user.id)
-    if state == WAIT_ADMIN_PHOTO and is_admin(update):
-        await handle_admin_upload(update)
+    if user_state.get(user.id) == WAIT_ADMIN_STICKER and is_admin(update):
+        await update.effective_message.reply_text(
+            "Нужен стикер из пака, не фото.",
+            reply_markup=admin_keyboard(),
+        )
         return
-    if state == WAIT_USER_PHOTO or state is None:
-        await send_reply_photo(update, context)
+    await send_reply_sticker(update, context)
+
+
+async def on_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    if is_admin(update) and user_state.get(user.id) == WAIT_ADMIN_STICKER:
+        await handle_admin_sticker(update, context)
+        return
+    await update.effective_message.reply_text(
+        "Пришли фото, не стикер.",
+        reply_markup=main_keyboard(is_admin(update)),
+    )
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -299,28 +354,43 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("Главное меню.", reply_markup=main_keyboard(admin))
         return
 
-    if admin and text == BTN_SET_PHOTO:
-        user_state[user.id] = WAIT_ADMIN_PHOTO
+    if admin and text == BTN_SET_PACK:
+        user_state[user.id] = WAIT_ADMIN_STICKER
         await message.reply_text(
-            "Пришли фото, которое бот будет отдавать вместо «раздетого».",
+            "Пришли любой стикер из нужного пака.",
             reply_markup=admin_keyboard(),
         )
         return
 
-    if admin and text == BTN_SHOW_PHOTO:
-        file_id = get_reply_file_id()
-        if not file_id:
-            await message.reply_text("Фото ответа ещё не загружено.", reply_markup=admin_keyboard())
+    if admin and text == BTN_SHOW_PACK:
+        set_name = get_sticker_set_name()
+        if not set_name:
+            await message.reply_text("Пак ещё не загружен.", reply_markup=admin_keyboard())
             return
-        await message.reply_photo(photo=file_id, caption="Текущее фото ответа.", reply_markup=admin_keyboard())
+        try:
+            sticker, pack = await pick_random_sticker(context, set_name)
+        except Exception:
+            await message.reply_text(
+                f"Не смог открыть пак {set_name}. Загрузи его ещё раз.",
+                reply_markup=admin_keyboard(),
+            )
+            return
+        count = len(pack.stickers or []) if pack else 0
+        title = (pack.title if pack else set_name) or set_name
+        if sticker:
+            await message.reply_sticker(sticker=sticker.file_id)
+        await message.reply_text(
+            f"Текущий пак: «{title}»\nСтикеров: {count}\nИмя: {set_name}",
+            reply_markup=admin_keyboard(),
+        )
         return
 
     if admin and text == BTN_STATS:
         with data_lock:
             payload = load_data()
-        ready = "да" if payload.get("reply_file_id") else "нет"
+        pack = payload.get("sticker_set") or "нет"
         await message.reply_text(
-            f"Запросов: {payload.get('requests', 0)}\nФото ответа загружено: {ready}",
+            f"Запросов: {payload.get('requests', 0)}\nСтикерпак: {pack}",
             reply_markup=admin_keyboard(),
         )
         return
@@ -329,12 +399,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("Нужно именно фото, не текст.")
         return
 
-    if user_state.get(user.id) == WAIT_ADMIN_PHOTO:
-        await message.reply_text("Пришли именно фото для ответа.")
+    if user_state.get(user.id) == WAIT_ADMIN_STICKER:
+        await message.reply_text("Пришли стикер из пака.")
         return
 
     await message.reply_text(
-        "Нажми «Раздеть фото», потом пришли снимок.",
+        "Пришли фото, которое хочешь раздеть.",
         reply_markup=main_keyboard(admin),
     )
 
@@ -423,6 +493,7 @@ def main() -> None:
             app.add_handler(CommandHandler("start", cmd_start))
             app.add_handler(CommandHandler("admin", cmd_admin))
             app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
+            app.add_handler(MessageHandler(filters.Sticker.ALL, on_sticker))
             app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
             app.add_error_handler(on_error)
             log.info("polling…")
